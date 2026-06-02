@@ -1,0 +1,12 @@
+# Update check stamp files — prevents GitHub API hammering
+.GSI_last_update_check
+.GSI_share_update_check
+
+# Backup files from auto-update
+*.bak
+
+# Common Windows/PowerShell artifacts
+.DS_Store
+Thumbs.db
+*.psm1.bak
+*.ps1.bak
