@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2026 Foowy. Licensed under the MIT License.
+#Copyright (c) 2026 Foowy. Licensed under the MIT License.
 #Requires -Version 3.0
 
 param(
