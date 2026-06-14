@@ -36,19 +36,18 @@ param(
     The final output is formatted as a text summary displayed to the console.
 
 .NOTES
-    Version : 1.2.0
+    Version : 1.3.0
     Author  : Foowy
     GitHub  : https://github.com/Foowy/Server_info
 
     Requires administrative privileges for accurate remote metrics and reliable access to system classes.
     Target platforms: Windows Server 2008 and later, or any system with PowerShell 3.0+.
     Supports comma-separated server names for polling multiple servers in one invocation.
-    Auto-update checks once per day against the GitHub repository (unauthenticated; add a Token key to
-    $updateConfig for authenticated access if rate limits become an issue).
+    Auto-update checks once per day against the GitHub repository using the git blob SHA for comparison.
 
 #>
 
-$script:Version   = '1.2.0'
+$script:Version   = '1.3.0'
 $script:ScriptDir = Split-Path -Path $PSCommandPath -Parent
 
 # Shared CIM collection block -- used by both local and remote paths to avoid duplicating the five queries
@@ -71,18 +70,19 @@ function Start-ElevatedScript {
     param([string]$ScriptPath, [string]$ArgString = '')
     $dir = Split-Path $ScriptPath -Parent
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName        = 'powershell.exe'
+    $psi.FileName        = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     $psi.Arguments       = "-NoExit -NoProfile -ExecutionPolicy Bypass -Command `"Set-Location '$dir'; & '$ScriptPath' $ArgString`""
     $psi.Verb            = 'runas'
     $psi.UseShellExecute = $true
-    [System.Diagnostics.Process]::Start($psi) | Out-Null
+    return [System.Diagnostics.Process]::Start($psi)
 }
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Output 'Restarting with elevated privileges...'
     if (-not $ComputerName) { $ComputerName = Read-ComputerNames }
     # Pass collected names comma-joined so the elevated session skips the prompt
-    Start-ElevatedScript -ScriptPath $PSCommandPath -ArgString "-ComputerName '$($ComputerName -join ',')'"
+    $newProc = Start-ElevatedScript -ScriptPath $PSCommandPath -ArgString "-ComputerName '$($ComputerName -join ',')'"
+    if (-not $newProc) { Write-Warning 'Failed to launch elevated session.' }
     exit
 }
 
@@ -121,7 +121,7 @@ function Invoke-UpdateCheck {
 
     $apiUrl = "https://api.github.com/repos/$($Config.Owner)/$($Config.Repo)/contents/$($Config.FilePath)?ref=$($Config.Branch)"
     $headers = @{
-        Accept       = 'application/vnd.github.v3.raw'
+        Accept       = 'application/vnd.github.v3+json'
         'User-Agent' = 'PowerShell-AutoUpdater'
     }
 
@@ -129,7 +129,7 @@ function Invoke-UpdateCheck {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     try {
-        $remoteContent = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
     }
     catch {
         Write-Warning "Update check failed -- could not reach GitHub: $_"
@@ -138,26 +138,38 @@ function Invoke-UpdateCheck {
         return
     }
 
-    $localContent = Get-Content -Path $PSCommandPath -Raw
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    $enc = [System.Text.Encoding]::UTF8
-    $localHash  = [System.BitConverter]::ToString($sha.ComputeHash($enc.GetBytes($localContent))).Replace('-', '').ToLower()
-    $remoteHash = [System.BitConverter]::ToString($sha.ComputeHash($enc.GetBytes($remoteContent))).Replace('-', '').ToLower()
-    $sha.Dispose()
+    # Compute git blob SHA-1 of the local file: SHA1("blob {size}\0{bytes}")
+    # Matches the sha field GitHub returns -- encoding-agnostic, no string normalization needed
+    $localBytes = [System.IO.File]::ReadAllBytes($PSCommandPath)
+    $header     = [System.Text.Encoding]::ASCII.GetBytes("blob $($localBytes.Length)`0")
+    $ms         = [System.IO.MemoryStream]::new($header.Length + $localBytes.Length)
+    $ms.Write($header, 0, $header.Length)
+    $ms.Write($localBytes, 0, $localBytes.Length)
+    $ms.Position = 0
+    $sha1     = [System.Security.Cryptography.SHA1]::Create()
+    $localSha = [System.BitConverter]::ToString($sha1.ComputeHash($ms)).Replace('-', '').ToLower()
+    $sha1.Dispose()
+    $ms.Dispose()
 
     # Write stamp regardless of result to prevent re-checking on every run
     (Get-Date).ToString('o') | Set-Content $Config.StampFile
 
-    if ($localHash -eq $remoteHash) {
+    if ($localSha -eq $response.sha) {
         Write-Host 'Script is up to date.' -ForegroundColor Green
         return
     }
 
     Write-Host 'Update available -- applying update...' -ForegroundColor Yellow
 
+    # Decode base64 content from API response; normalize to LF so the written file matches what git stores
+    $cleanB64      = $response.content -replace '\s', ''
+    $remoteContent = [System.Text.Encoding]::UTF8.GetString(
+        [System.Convert]::FromBase64String($cleanB64)
+    ).Replace("`r`n", "`n").Replace("`r", "`n")
+
     try {
         Copy-Item -Path $PSCommandPath -Destination "$PSCommandPath.bak" -Force
-        [System.IO.File]::WriteAllText($PSCommandPath, $remoteContent, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($PSCommandPath, $remoteContent, [System.Text.UTF8Encoding]::new($false))
         Write-Host 'Update applied successfully. Relaunching...' -ForegroundColor Green
     }
     catch {
@@ -166,9 +178,13 @@ function Invoke-UpdateCheck {
     }
 
     $argString = if ($ForwardedArgs) { "-ComputerName '$($ForwardedArgs -join ',')'" } else { '' }
-    Start-ElevatedScript -ScriptPath $PSCommandPath -ArgString $argString
-    # Kill current process to close this window after launching the updated version
-    [System.Diagnostics.Process]::GetCurrentProcess().Kill()
+    $newProc   = Start-ElevatedScript -ScriptPath $PSCommandPath -ArgString $argString
+    if ($newProc) {
+        # Kill current process to close this window after launching the updated version
+        [System.Diagnostics.Process]::GetCurrentProcess().Kill()
+    } else {
+        Write-Warning 'Relaunch failed -- continuing with the updated script in this window.'
+    }
 }
 
 # Runs at most once per calendar day, forwards ComputerName into relaunched process if an update is applied
@@ -202,7 +218,9 @@ function Get-SafeCimOrWmi {
 
     if ($CimSession) {
         try {
-            return Get-CimInstance -ClassName $Class -Namespace root/cimv2 -Filter $Filter -CimSession $CimSession -ErrorAction Stop
+            $cimParams = @{ ClassName = $Class; Namespace = 'root/cimv2'; CimSession = $CimSession; ErrorAction = 'Stop' }
+            if ($Filter) { $cimParams.Filter = $Filter }
+            return Get-CimInstance @cimParams
         }
         catch {
             # Intentionally empty -- suppress the CIM error and fall through to the WMI fallback
@@ -347,7 +365,7 @@ function Get-UptimeMetric {
 
         if (-not $sys) { throw 'Unable to retrieve uptime data.' }
 
-        $uptimeSec = [int]$sys.SystemUpTime
+        $uptimeSec = [long]$sys.SystemUpTime
         $uptime    = New-TimeSpan -Seconds $uptimeSec
         $lastBoot  = (Get-Date).AddSeconds(-$uptimeSec)
         [PSCustomObject]@{
@@ -475,7 +493,7 @@ function Get-ServerMetric {
     $summaryDivider = '-' * $summaryHeader.Length
     $summaryLine = '{0,-22} | {1,10} | {2,-22} | {3,-26} | {4,-16}' -f `
         $ComputerName, `
-        ('{0,5}' -f $results.CPU.Load), `
+        ('{0,4}%' -f $results.CPU.Load), `
         "$($results.Memory.UsedGB) GB ($($results.Memory.Percent)%)", `
         ('{0} ({1}%)' -f (Convert-GB $results.Storage.UsedGB), $results.Storage.Percent), `
         ('{0}d {1}h {2}m {3}s' -f $results.Uptime.Days, $results.Uptime.Hours, $results.Uptime.Minutes, $results.Uptime.Seconds)

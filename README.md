@@ -8,7 +8,7 @@ PowerShell scripts to quickly collect and display Windows server health metrics 
 
 | Script | Version | Purpose |
 |---|---|---|
-| [Get_Server_Info.ps1](Get_Server_Info.ps1) | 1.1.0 | Server health metrics (CPU, memory, disk, uptime, network) |
+| [Get_Server_Info.ps1](Get_Server_Info.ps1) | 1.2.0 | Server health metrics (CPU, memory, disk, uptime, network) |
 | [Get-ShareInfo.ps1](Get-ShareInfo.ps1) | 1.0.0 | SMB share disk usage audit with CSV export |
 
 ---
@@ -28,7 +28,7 @@ PowerShell scripts to quickly collect and display Windows server health metrics 
 
 - Windows PowerShell 3.0 or later
 - Administrative privileges on the target computer(s)
-- Windows Server 2008 Non-R2 or later (or any system with PowerShell 3.0+)
+- Windows Server 2008 and later (or any system with PowerShell 3.0+)
 - Optional: PowerShell remoting (WinRM) enabled for fast remote collection
 
 ### Usage
@@ -87,18 +87,9 @@ MAC     : 00-1A-2B-3C-4D-5E
 
 ### Auto-Update
 
-The script checks GitHub once per day for updates. To enable authenticated access (higher GitHub API rate limits), add a `Token` key to the `$updateConfig` hash in the script:
+The script checks GitHub once per day for updates using the GitHub Contents API. If an update is found it backs up the current version to `Get_Server_Info.ps1.bak`, writes the new version, and relaunches automatically.
 
-```powershell
-$updateConfig = @{
-    Owner     = 'Foowy'
-    Repo      = 'Server_info'
-    Branch    = 'main'
-    FilePath  = 'Get_Server_Info.ps1'
-    StampFile = Join-Path (Split-Path $PSCommandPath -Parent) '.GSI_last_update_check'
-    Token     = 'your_github_pat_here'  # Optional: GitHub Personal Access Token
-}
-```
+Update detection compares the local file's git blob SHA-1 against the SHA returned by the API, so line-ending differences between platforms never trigger false updates.
 
 ---
 
