@@ -268,7 +268,7 @@ function Get-MemoryMetric {
             TotalGB = [math]::Round($totalKB / 1MB, 2)
             UsedGB  = [math]::Round($usedKB  / 1MB, 2)
             FreeGB  = [math]::Round($freeKB  / 1MB, 2)
-            Percent = [math]::Round(($usedKB / $totalKB) * 100, 1)
+            Percent = if ($totalKB -gt 0) { [math]::Round(($usedKB / $totalKB) * 100, 1) } else { 0 }
             Error   = $null
         }
     }
