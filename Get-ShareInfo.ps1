@@ -183,12 +183,13 @@ function Convert-BytesToReadable {
 
     $sizes = 'B', 'KB', 'MB', 'GB', 'TB'
     $order = 0
-    while ($Bytes -ge 1024 -and $order -lt $sizes.Count - 1) {
+    [double]$value = $Bytes
+    while ($value -ge 1024 -and $order -lt $sizes.Count - 1) {
         $order++
-        $Bytes = $Bytes / 1024
+        $value = $value / 1024
     }
 
-    return '{0:N2} {1}' -f $Bytes, $sizes[$order]
+    return '{0:N2} {1}' -f $value, $sizes[$order]
 }
 
 function Get-RemoteShareSize {
@@ -299,9 +300,8 @@ function Invoke-ShareAudit {
         $ComputerName = $rawInput -split ',' | ForEach-Object { $_.Trim() }
     }
 
-    if ($ComputerName.Count -eq 1 -and $ComputerName[0] -match ',') {
-        $ComputerName = $ComputerName[0] -split ',' | ForEach-Object { $_.Trim() }
-    }
+    # Always re-split every element -- elevation and prompt paths join with commas into one element
+    $ComputerName = @($ComputerName | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 
     $allResults = @()
 
