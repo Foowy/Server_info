@@ -360,11 +360,11 @@ function Get-UptimeMetric {
         $lastBoot = $null
         if ($RemoteData) {
             $os = $RemoteData.OS | Select-Object -First 1
-            if ($os -and $os.LastBootUpTime) { $lastBoot = $os.LastBootUpTime }
+            if ($os -and $os.LastBootUpTime) { $lastBoot = [datetime]$os.LastBootUpTime }
         }
         else {
             $os = Get-SafeCimOrWmi -Class 'Win32_OperatingSystem' -ComputerName $ComputerName -CimSession $CimSession
-            if ($os -and $os.LastBootUpTime) { $lastBoot = ($os | Select-Object -First 1).LastBootUpTime }
+            if ($os -and $os.LastBootUpTime) { $lastBoot = [datetime]($os | Select-Object -First 1).LastBootUpTime }
         }
 
         if (-not $lastBoot) {
@@ -374,7 +374,7 @@ function Get-UptimeMetric {
             $lastBoot = (Get-Date).AddSeconds(-[long]$sys.SystemUpTime)
         }
 
-        $uptime = (Get-Date) - $lastBoot
+        $uptime = (Get-Date) - [datetime]$lastBoot
         [PSCustomObject]@{
             LastBoot = $lastBoot
             Days     = [int]$uptime.Days
