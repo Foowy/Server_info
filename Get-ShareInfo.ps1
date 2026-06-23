@@ -222,6 +222,9 @@ function Get-RemoteShareSize {
         $received = Receive-Job -Job $job
         Remove-Job -Job $job
 
+        if ($null -eq $received) {
+            return @{ Size = 0; Status = 'Error: job returned no output' }
+        }
         if ($received.Size -eq 0 -and $received.HadErrors) {
             return @{ Size = 0; Status = 'Access Denied' }
         }
@@ -336,9 +339,19 @@ function Invoke-ShareAudit {
         }
     }
 
-    if ($OutputPath -and $allResults.Count -gt 0) {
-        $allResults | Export-Csv -Path $OutputPath -NoTypeInformation -Force
-        Write-Host "Results exported to: $OutputPath" -ForegroundColor Green
+    if ($OutputPath) {
+        if ($allResults.Count -eq 0) {
+            Write-Warning "No results to export -- all share enumerations failed."
+        }
+        else {
+            try {
+                $allResults | Export-Csv -Path $OutputPath -NoTypeInformation -Force -ErrorAction Stop
+                Write-Host "Results exported to: $OutputPath" -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "Failed to export CSV to '${OutputPath}': $_"
+            }
+        }
     }
 }
 
