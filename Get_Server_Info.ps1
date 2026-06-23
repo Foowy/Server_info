@@ -161,15 +161,14 @@ function Invoke-UpdateCheck {
 
     Write-Host 'Update available -- applying update...' -ForegroundColor Yellow
 
-    # Decode base64 content from API response; normalize to LF so the written file matches what git stores
-    $cleanB64      = $response.content -replace '\s', ''
-    $remoteContent = [System.Text.Encoding]::UTF8.GetString(
-        [System.Convert]::FromBase64String($cleanB64)
-    ).Replace("`r`n", "`n").Replace("`r", "`n")
+    # Decode raw bytes from base64 -- write exactly what GitHub has so the local git blob SHA matches next run
+    $cleanB64    = $response.content -replace '\s', ''
+    $remoteBytes = [System.Convert]::FromBase64String($cleanB64)
 
     try {
         Copy-Item -Path $PSCommandPath -Destination "$PSCommandPath.bak" -Force
-        [System.IO.File]::WriteAllText($PSCommandPath, $remoteContent, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllBytes($PSCommandPath, $remoteBytes)
+        Remove-Item -Path "$PSCommandPath.bak" -Force -ErrorAction SilentlyContinue
         Write-Host 'Update applied successfully. Relaunching...' -ForegroundColor Green
     }
     catch {
@@ -190,10 +189,8 @@ function Invoke-UpdateCheck {
 # Runs at most once per calendar day, forwards ComputerName into relaunched process if an update is applied
 Invoke-UpdateCheck -Config $updateConfig -ForwardedArgs $ComputerName
 
-# Elevation and update relaunches pass multiple servers as a comma-joined single string -- re-split it here
-if ($ComputerName.Count -eq 1 -and $ComputerName[0] -match ',') {
-    $ComputerName = $ComputerName[0] -split ',' | ForEach-Object { $_.Trim() }
-}
+# Always re-split every element -- elevation and update relaunches join with commas, and users may too
+$ComputerName = @($ComputerName | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 
 if (-not $ComputerName) {
     $ComputerName = Read-ComputerNames
@@ -338,8 +335,10 @@ function Get-CpuMetric {
 
         if (-not $cpu) { throw 'Unable to retrieve CPU data.' }
 
+        $avg = ($cpu.LoadPercentage | Measure-Object -Average).Average
+        if ($null -eq $avg) { throw 'CPU LoadPercentage unavailable (all sockets returned null).' }
         [PSCustomObject]@{
-            Load  = [math]::Round(($cpu.LoadPercentage | Measure-Object -Average).Average, 1)
+            Load  = [math]::Round($avg, 1)
             Error = $null
         }
     }
@@ -356,27 +355,36 @@ function Get-UptimeMetric {
         $RemoteData
     )
     try {
+        # Prefer LastBootUpTime from Win32_OperatingSystem -- already collected, reliable on all targets
+        # Fall back to Win32_PerfFormattedData_PerfOS_System.SystemUpTime (unavailable when perf subsystem is off)
+        $lastBoot = $null
         if ($RemoteData) {
-            $sys = $RemoteData.Perf
+            $os = $RemoteData.OS | Select-Object -First 1
+            if ($os -and $os.LastBootUpTime) { $lastBoot = $os.LastBootUpTime }
         }
         else {
-            $sys = Get-SafeCimOrWmi -Class 'Win32_PerfFormattedData_PerfOS_System' -ComputerName $ComputerName -CimSession $CimSession
+            $os = Get-SafeCimOrWmi -Class 'Win32_OperatingSystem' -ComputerName $ComputerName -CimSession $CimSession
+            if ($os -and $os.LastBootUpTime) { $lastBoot = ($os | Select-Object -First 1).LastBootUpTime }
         }
 
-        if (-not $sys) { throw 'Unable to retrieve uptime data.' }
+        if (-not $lastBoot) {
+            if ($RemoteData) { $sys = $RemoteData.Perf }
+            else { $sys = Get-SafeCimOrWmi -Class 'Win32_PerfFormattedData_PerfOS_System' -ComputerName $ComputerName -CimSession $CimSession }
+            if (-not $sys -or [long]$sys.SystemUpTime -eq 0) { throw 'Unable to retrieve uptime data.' }
+            $lastBoot = (Get-Date).AddSeconds(-[long]$sys.SystemUpTime)
+        }
 
-        $uptimeSec = [long]$sys.SystemUpTime
-        $uptime    = New-TimeSpan -Seconds $uptimeSec
-        $lastBoot  = (Get-Date).AddSeconds(-$uptimeSec)
+        $uptime = (Get-Date) - $lastBoot
         [PSCustomObject]@{
             LastBoot = $lastBoot
-            Days     = $uptime.Days
-            Hours    = $uptime.Hours
-            Minutes  = $uptime.Minutes
-            Seconds  = $uptime.Seconds
+            Days     = [int]$uptime.Days
+            Hours    = [int]$uptime.Hours
+            Minutes  = [int]$uptime.Minutes
+            Seconds  = [int]$uptime.Seconds
         }
     }
     catch {
+        Write-Warning "${ComputerName}: Uptime metric failed - $($_.Exception.Message)"
         [PSCustomObject]@{ LastBoot = $null; Days = 0; Hours = 0; Minutes = 0; Seconds = 0 }
     }
 }
@@ -398,9 +406,9 @@ function Get-NetworkInfo {
         if (-not $adapters) { throw 'Unable to retrieve network data.' }
 
         $output = foreach ($a in $adapters) {
-            $ipv4       = $a.IPAddress | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' }
+            $ipv4       = $a.IPAddress | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
             # IPSubnet mixes IPv4 masks (e.g. "255.255.255.0") and IPv6 prefix lengths (e.g. "64") -- keep only IPv4 masks
-            $ipv4Subnet = $a.IPSubnet | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' }
+            $ipv4Subnet = $a.IPSubnet | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
             [PSCustomObject]@{
                 Adapter   = $a.Description
                 IPAddress = ($ipv4       -join ', ')
@@ -421,8 +429,14 @@ function Get-NetworkInfo {
 # Test-WSMan probe -- if WinRM responds, all metrics can be gathered in a single Invoke-Command round-trip
 function Test-PowerShellRemoting {
     param([string]$ComputerName)
-    try { Test-WSMan -ComputerName $ComputerName -ErrorAction Stop | Out-Null; return $true }
-    catch { return $false }
+    # Run in a job with a 5s timeout -- packet-dropping firewalls can stall Test-WSMan for 21s+ per host
+    $job  = Start-Job -ScriptBlock { param($c) Test-WSMan -ComputerName $c -ErrorAction Stop } -ArgumentList $ComputerName
+    $done = Wait-Job -Job $job -Timeout 5
+    if ($null -eq $done) { Remove-Job -Job $job -Force; return $false }
+    $ok = $true
+    try { Receive-Job -Job $job -ErrorAction Stop | Out-Null } catch { $ok = $false }
+    Remove-Job -Job $job -ErrorAction SilentlyContinue
+    return $ok
 }
 
 # Opens a persistent CIM session to avoid a separate connection per metric call when remoting is unavailable
