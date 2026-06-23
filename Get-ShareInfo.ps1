@@ -112,14 +112,15 @@ function Invoke-UpdateCheck {
 
     $apiUrl = "https://api.github.com/repos/$($Config.Owner)/$($Config.Repo)/contents/$($Config.FilePath)?ref=$($Config.Branch)"
     $headers = @{
-        Accept       = 'application/vnd.github.v3.raw'
+        Accept       = 'application/vnd.github.v3+json'
         'User-Agent' = 'PowerShell-AutoUpdater'
     }
 
+    # Force TLS 1.2 -- required by GitHub, older PowerShell sessions default to TLS 1.0
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     try {
-        $remoteContent = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
+        $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
     }
     catch {
         Write-Warning "Update check failed - could not reach GitHub: $_"
@@ -127,20 +128,34 @@ function Invoke-UpdateCheck {
         return
     }
 
-    $localContent = Get-Content -Path $PSCommandPath -Raw
-    $sha          = [System.Security.Cryptography.SHA256]::Create()
-    $localHash    = ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($localContent))  | ForEach-Object { $_.ToString('x2') }) -join ''
-    $remoteHash   = ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($remoteContent)) | ForEach-Object { $_.ToString('x2') }) -join ''
-    $sha.Dispose()
+    # Compute git blob SHA-1 of the local file: SHA1("blob {size}\0{bytes}")
+    # Matches the sha field GitHub returns -- encoding-agnostic, no string normalization needed
+    $localBytes = [System.IO.File]::ReadAllBytes($PSCommandPath)
+    $header     = [System.Text.Encoding]::ASCII.GetBytes("blob $($localBytes.Length)`0")
+    $ms         = [System.IO.MemoryStream]::new($header.Length + $localBytes.Length)
+    $ms.Write($header, 0, $header.Length)
+    $ms.Write($localBytes, 0, $localBytes.Length)
+    $ms.Position = 0
+    $sha1     = [System.Security.Cryptography.SHA1]::Create()
+    $localSha = [System.BitConverter]::ToString($sha1.ComputeHash($ms)).Replace('-', '').ToLower()
+    $sha1.Dispose()
+    $ms.Dispose()
 
     (Get-Date).ToString('o') | Set-Content $Config.StampFile
 
-    if ($localHash -eq $remoteHash) {
+    if ($localSha -eq $response.sha) {
         Write-Host 'Script is up to date.' -ForegroundColor Green
         return
     }
 
     Write-Host 'Update available - applying update...' -ForegroundColor Yellow
+
+    # Decode base64 content from API response; normalize to LF so the written file matches what git stores
+    $cleanB64      = $response.content -replace '\s', ''
+    $remoteContent = [System.Text.Encoding]::UTF8.GetString(
+        [System.Convert]::FromBase64String($cleanB64)
+    ).Replace("`r`n", "`n").Replace("`r", "`n")
+
     $backupPath = "$PSCommandPath.bak"
     try {
         Copy-Item -Path $PSCommandPath -Destination $backupPath -Force
