@@ -364,7 +364,13 @@ function Get-UptimeMetric {
         }
         else {
             $os = Get-SafeCimOrWmi -Class 'Win32_OperatingSystem' -ComputerName $ComputerName -CimSession $CimSession
-            if ($os -and $os.LastBootUpTime) { $lastBoot = [datetime]($os | Select-Object -First 1).LastBootUpTime }
+            $raw = if ($os) { ($os | Select-Object -First 1).LastBootUpTime } else { $null }
+            if ($raw) {
+                # WMI returns LastBootUpTime as a DMTF string; CIM returns a real DateTime
+                $lastBoot = if ($raw -is [string]) {
+                    [System.Management.ManagementDateTimeConverter]::ToDateTime($raw)
+                } else { [datetime]$raw }
+            }
         }
 
         if (-not $lastBoot) {
