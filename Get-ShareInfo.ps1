@@ -172,8 +172,12 @@ function Invoke-UpdateCheck {
     $psi.Arguments      = "-NoExit -NoProfile -ExecutionPolicy Bypass -Command `"Set-Location '$scriptDir'; & '$PSCommandPath' $argString`""
     $psi.Verb           = 'runas'
     $psi.UseShellExecute = $true
-    [System.Diagnostics.Process]::Start($psi) | Out-Null
-    [System.Diagnostics.Process]::GetCurrentProcess().Kill()
+    $newProc = [System.Diagnostics.Process]::Start($psi)
+    if ($newProc) {
+        [System.Diagnostics.Process]::GetCurrentProcess().Kill()
+    } else {
+        Write-Warning 'Relaunch failed -- continuing with the updated script in this window.'
+    }
 }
 
 function Convert-BytesToReadable {
