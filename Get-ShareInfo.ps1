@@ -150,16 +150,14 @@ function Invoke-UpdateCheck {
 
     Write-Host 'Update available - applying update...' -ForegroundColor Yellow
 
-    # Decode base64 content from API response; normalize to LF so the written file matches what git stores
-    $cleanB64      = $response.content -replace '\s', ''
-    $remoteContent = [System.Text.Encoding]::UTF8.GetString(
-        [System.Convert]::FromBase64String($cleanB64)
-    ).Replace("`r`n", "`n").Replace("`r", "`n")
+    # Decode raw bytes from base64 -- write exactly what GitHub has so the local git blob SHA matches next run
+    $cleanB64    = $response.content -replace '\s', ''
+    $remoteBytes = [System.Convert]::FromBase64String($cleanB64)
 
-    $backupPath = "$PSCommandPath.bak"
     try {
-        Copy-Item -Path $PSCommandPath -Destination $backupPath -Force
-        [System.IO.File]::WriteAllText($PSCommandPath, $remoteContent, [System.Text.Encoding]::UTF8)
+        Copy-Item -Path $PSCommandPath -Destination "$PSCommandPath.bak" -Force
+        [System.IO.File]::WriteAllBytes($PSCommandPath, $remoteBytes)
+        Remove-Item -Path "$PSCommandPath.bak" -Force -ErrorAction SilentlyContinue
         Write-Host 'Update applied successfully. Relaunching...' -ForegroundColor Green
     }
     catch {
@@ -202,14 +200,11 @@ function Get-RemoteShareSize {
     try {
         $job = Start-Job -ScriptBlock {
             param($Path)
-            try {
-                $size = (Get-ChildItem -Path $Path -Recurse -ErrorAction SilentlyContinue |
-                         Measure-Object -Property Length -Sum).Sum
-                return [long]($size -as [long])
-            }
-            catch {
-                return 0
-            }
+            # Capture errors separately so fully-denied shares (size=0, errors>0) can be distinguished from empty shares
+            $errs = @()
+            $size = (Get-ChildItem -Path $Path -Recurse -ErrorAction SilentlyContinue -ErrorVariable errs |
+                     Measure-Object -Property Length -Sum).Sum
+            [PSCustomObject]@{ Size = [long]($size -as [long]); HadErrors = ($errs.Count -gt 0) }
         } -ArgumentList $SharePath
 
         $result = Wait-Job -Job $job -Timeout $TimeoutSeconds
@@ -219,15 +214,15 @@ function Get-RemoteShareSize {
             return @{ Size = 0; Status = 'Timeout' }
         }
 
-        $size = Receive-Job -Job $job
+        $received = Receive-Job -Job $job
         Remove-Job -Job $job
 
-        return @{ Size = [long]($size -as [long]); Status = 'OK' }
-    }
-    catch {
-        if ($_.Exception.Message -like '*Access Denied*' -or $_.Exception.Message -like '*Access is denied*') {
+        if ($received.Size -eq 0 -and $received.HadErrors) {
             return @{ Size = 0; Status = 'Access Denied' }
         }
+        return @{ Size = $received.Size; Status = 'OK' }
+    }
+    catch {
         return @{ Size = 0; Status = "Error: $($_.Exception.Message)" }
     }
 }
@@ -272,7 +267,7 @@ function Get-AllShareInfo {
                 Path      = $share.Path
             }
 
-            if ($status -eq 'OK' -or $status -eq 'Partial Access') {
+            if ($status -eq 'OK') {
                 $totalSize += $sizeInfo.Size
                 $successCount++
             }
